@@ -18,7 +18,7 @@
 #ifndef DHT_H
 #define DHT_H
 
-#include "Arduino.h"
+#include <Bela.h>
 
 /* Uncomment to enable printing out nice debug messages. */
 //#define DHT_DEBUG
@@ -47,16 +47,6 @@ static const uint8_t DHT21{21};  /**< DHT TYPE 21 */
 static const uint8_t DHT22{22};  /**< DHT TYPE 22 */
 static const uint8_t AM2301{21}; /**< AM2301 */
 
-#if defined(TARGET_NAME) && (TARGET_NAME == ARDUINO_NANO33BLE)
-#ifndef microsecondsToClockCycles
-/*!
- * As of 7 Sep 2020 the Arduino Nano 33 BLE boards do not have
- * microsecondsToClockCycles defined.
- */
-#define microsecondsToClockCycles(a) ((a) * (SystemCoreClock / 1000000L))
-#endif
-#endif
-
 /*!
  *  @brief  Class that stores state and functions for DHT
  */
@@ -64,6 +54,7 @@ class DHT {
 public:
   DHT(uint8_t pin, uint8_t type, uint8_t count = 6);
   void begin(uint8_t usec = 55);
+  void process(BelaContext* context);
   float readTemperature(bool S = false, bool force = false);
   float convertCtoF(float);
   float convertFtoC(float);
@@ -76,34 +67,26 @@ public:
 private:
   uint8_t data[5];
   uint8_t _pin, _type;
-#ifdef __AVR
-  // Use direct GPIO access on an 8-bit AVR so keep track of the port and
-  // bitmask for the digital pin connected to the DHT.  Other platforms will use
-  // digitalRead.
-  uint8_t _bit, _port;
-#endif
-  uint32_t _lastreadtime, _maxcycles;
   bool _lastresult;
   uint8_t pullTime; // Time (in usec) to pull up data line before reading
 
   uint32_t expectPulse(bool level);
-};
-
-/*!
- *  @brief  Class that defines Interrupt Lock Avaiability
- */
-class InterruptLock {
 public:
-  InterruptLock() {
-#if !defined(ARDUINO_ARCH_NRF52)
-    noInterrupts();
-#endif
-  }
-  ~InterruptLock() {
-#if !defined(ARDUINO_ARCH_NRF52)
-    interrupts();
-#endif
-  }
+  enum State {
+    kDisabled,
+    kShouldStart,
+    kHostStartSignal,
+    kHostPullUp,
+    kWaitForInput,
+    kWaitForSensorRising,
+    kWaitForSensorFalling,
+    kBit,
+    kTxEnd,
+  } state = kDisabled;
+  void switchState(State newState);
+  int count;
+  int inIdx;
+  uint64_t inWord;
+  bool pastIn = false;
 };
-
 #endif

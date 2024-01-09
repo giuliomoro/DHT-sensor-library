@@ -24,6 +24,9 @@
  */
 
 #include "DHT.h"
+#include <math.h>
+#include <string.h>
+typedef uint16_t word;
 
 #define MIN_INTERVAL 2000 /**< min interval value */
 #define TIMEOUT                                                                \
@@ -43,15 +46,6 @@ DHT::DHT(uint8_t pin, uint8_t type, uint8_t count) {
   (void)count; // Workaround to avoid compiler warning.
   _pin = pin;
   _type = type;
-#ifdef __AVR
-  _bit = digitalPinToBitMask(pin);
-  _port = digitalPinToPort(pin);
-#endif
-  _maxcycles =
-      microsecondsToClockCycles(1000); // 1 millisecond timeout for
-                                       // reading pulses from DHT sensor.
-  // Note that count is now ignored as the DHT reading algorithm adjusts itself
-  // based on the speed of the processor.
 }
 
 /*!
@@ -61,12 +55,6 @@ DHT::DHT(uint8_t pin, uint8_t type, uint8_t count) {
  *starts. Default is 55 (see function declaration in DHT.h).
  */
 void DHT::begin(uint8_t usec) {
-  // set up the pins!
-  pinMode(_pin, INPUT_PULLUP);
-  // Using this value makes sure that millis() - lastreadtime will be
-  // >= MIN_INTERVAL right away. Note that this assignment wraps around,
-  // but so will the subtraction.
-  _lastreadtime = millis() - MIN_INTERVAL;
   DEBUG_PRINT("DHT max clock cycles: ");
   DEBUG_PRINTLN(_maxcycles, DEC);
   pullTime = usec;
@@ -221,6 +209,105 @@ float DHT::computeHeatIndex(float temperature, float percentHumidity,
   return isFahrenheit ? hi : convertFtoC(hi);
 }
 
+
+void DHT::switchState(DHT::State newState)
+{
+  state = newState;
+  count = 0;
+}
+
+void DHT::process(BelaContext* context)
+{
+  float tus = 1000.f * 1000.f / context->digitalSampleRate;
+  for(size_t n = 0; n < context->digitalFrames; ++n)
+  {
+    bool in = digitalRead(context, n, _pin);
+    switch(state)
+    {
+      case kDisabled:
+        break;
+      case kShouldStart:
+        switchState(kHostStartSignal);
+        // nobreak;
+      case kHostStartSignal:
+        {
+          pinModeOnce(context, n, _pin, OUTPUT);
+          digitalWriteOnce(context, n, _pin, 0);
+	  float target;
+          switch (_type) {
+          case DHT22:
+          case DHT21:
+            // data sheet says "at least 1ms"
+	    target = 1100;
+            break;
+          case DHT11:
+          default:
+            // data sheet says at least 18ms, 20ms just to be safe
+	    target = 20000;
+            break;
+          }
+          if(count * tus > target)
+            switchState(kHostPullUp);
+        }
+        break;
+      case kHostPullUp:
+        pinModeOnce(context, n, _pin, OUTPUT);
+        digitalWriteOnce(context, n, _pin, 1);
+        if(count * tus > 40)
+          switchState(kWaitForInput);
+        break;
+      case kWaitForInput:
+        pinModeOnce(context, n, _pin, INPUT);
+        if(count >= context->digitalFrames * 2 + 1)
+          switchState(kWaitForSensorRising);
+        break;
+      case kWaitForSensorRising:
+        if(in && !pastIn)
+          switchState(kWaitForSensorFalling);
+        break;
+      case kWaitForSensorFalling:
+        if(!in && pastIn) // falling edge
+        {
+          switchState(kBit);
+          inIdx = 0;
+	  memset(data, 0, sizeof(data));
+	  inWord = 0;
+        }
+        break;
+      case kBit:
+        if(in && !pastIn) // rising edge
+          count = 0;
+        if(!in && pastIn) // falling edge
+        {
+          bool val = count > 2;//(count * tus > 42);
+#ifdef DHT_DEBUG
+          rt_printf("[%d]%d(%d)  ", 40 - inIdx - 1, count, val);
+#endif // DHT_DEBUG
+	  data[inIdx / 8] <<= 1;
+	  data[inIdx / 8] |= val;
+	  inWord |= uint64_t(val) << (40 - inIdx - 1);
+          inIdx++;
+          if(40 == inIdx)
+          {
+#ifdef DHT_DEBUG
+            rt_printf("\n");
+#endif // DHT_DEBUG
+            switchState(kTxEnd);
+          }
+        }
+        break;
+      case kTxEnd:
+#ifdef DHT_DEBUG
+        rt_printf("INPUT: %010llx----\n", inWord);
+#endif // DHT_DEBUG
+        switchState(kDisabled);
+        break;
+    }
+    count++;
+    pastIn = in;
+  }
+}
+
 /*!
  *  @brief  Read value from sensor or return last one from less than two
  *seconds.
@@ -229,162 +316,23 @@ float DHT::computeHeatIndex(float temperature, float percentHumidity,
  *	@return float value
  */
 bool DHT::read(bool force) {
-  // Check if sensor was read less than two seconds ago and return early
-  // to use last reading.
-  uint32_t currenttime = millis();
-  if (!force && ((currenttime - _lastreadtime) < MIN_INTERVAL)) {
-    return _lastresult; // return last correct measurement
-  }
-  _lastreadtime = currenttime;
-
-  // Reset 40 bits of received data to zero.
-  data[0] = data[1] = data[2] = data[3] = data[4] = 0;
-
-#if defined(ESP8266)
-  yield(); // Handle WiFi / reset software watchdog
-#endif
-
-  // Send start signal.  See DHT datasheet for full signal diagram:
-  //   http://www.adafruit.com/datasheets/Digital%20humidity%20and%20temperature%20sensor%20AM2302.pdf
-
-  // Go into high impedence state to let pull-up raise data line level and
-  // start the reading process.
-  pinMode(_pin, INPUT_PULLUP);
-  delay(1);
-
-  // First set data line low for a period according to sensor type
-  pinMode(_pin, OUTPUT);
-  digitalWrite(_pin, LOW);
-  switch (_type) {
-  case DHT22:
-  case DHT21:
-    delayMicroseconds(1100); // data sheet says "at least 1ms"
-    break;
-  case DHT11:
-  default:
-    delay(20); // data sheet says at least 18ms, 20ms just to be safe
-    break;
-  }
-
-  uint32_t cycles[80];
-  {
-    // End the start signal by setting data line high for 40 microseconds.
-    pinMode(_pin, INPUT_PULLUP);
-
-    // Delay a moment to let sensor pull data line low.
-    delayMicroseconds(pullTime);
-
-    // Now start reading the data line to get the value from the DHT sensor.
-
-    // Turn off interrupts temporarily because the next sections
-    // are timing critical and we don't want any interruptions.
-    InterruptLock lock;
-
-    // First expect a low signal for ~80 microseconds followed by a high signal
-    // for ~80 microseconds again.
-    if (expectPulse(LOW) == TIMEOUT) {
-      DEBUG_PRINTLN(F("DHT timeout waiting for start signal low pulse."));
-      _lastresult = false;
-      return _lastresult;
-    }
-    if (expectPulse(HIGH) == TIMEOUT) {
-      DEBUG_PRINTLN(F("DHT timeout waiting for start signal high pulse."));
-      _lastresult = false;
-      return _lastresult;
-    }
-
-    // Now read the 40 bits sent by the sensor.  Each bit is sent as a 50
-    // microsecond low pulse followed by a variable length high pulse.  If the
-    // high pulse is ~28 microseconds then it's a 0 and if it's ~70 microseconds
-    // then it's a 1.  We measure the cycle count of the initial 50us low pulse
-    // and use that to compare to the cycle count of the high pulse to determine
-    // if the bit is a 0 (high state cycle count < low state cycle count), or a
-    // 1 (high state cycle count > low state cycle count). Note that for speed
-    // all the pulses are read into a array and then examined in a later step.
-    for (int i = 0; i < 80; i += 2) {
-      cycles[i] = expectPulse(LOW);
-      cycles[i + 1] = expectPulse(HIGH);
-    }
-  } // Timing critical code is now complete.
-
-  // Inspect pulses and determine which ones are 0 (high state cycle count < low
-  // state cycle count), or 1 (high state cycle count > low state cycle count).
-  for (int i = 0; i < 40; ++i) {
-    uint32_t lowCycles = cycles[2 * i];
-    uint32_t highCycles = cycles[2 * i + 1];
-    if ((lowCycles == TIMEOUT) || (highCycles == TIMEOUT)) {
-      DEBUG_PRINTLN(F("DHT timeout waiting for pulse."));
-      _lastresult = false;
-      return _lastresult;
-    }
-    data[i / 8] <<= 1;
-    // Now compare the low and high cycle times to see if the bit is a 0 or 1.
-    if (highCycles > lowCycles) {
-      // High cycles are greater than 50us low cycle count, must be a 1.
-      data[i / 8] |= 1;
-    }
-    // Else high cycles are less than (or equal to, a weird case) the 50us low
-    // cycle count so this must be a zero.  Nothing needs to be changed in the
-    // stored data.
-  }
-
   DEBUG_PRINTLN(F("Received from DHT:"));
-  DEBUG_PRINT(data[0], HEX);
-  DEBUG_PRINT(F(", "));
-  DEBUG_PRINT(data[1], HEX);
-  DEBUG_PRINT(F(", "));
-  DEBUG_PRINT(data[2], HEX);
-  DEBUG_PRINT(F(", "));
-  DEBUG_PRINT(data[3], HEX);
-  DEBUG_PRINT(F(", "));
-  DEBUG_PRINT(data[4], HEX);
+  for(size_t n = 0; n < 4; ++n)
+  {
+	  DEBUG_PRINT(int(data[n]), HEX);
+	  DEBUG_PRINT(F(", "));
+  }
   DEBUG_PRINT(F(" =? "));
   DEBUG_PRINTLN((data[0] + data[1] + data[2] + data[3]) & 0xFF, HEX);
 
   // Check we read 40 bits and that the checksum matches.
   if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
     _lastresult = true;
-    return _lastresult;
+    DEBUG_PRINTLN(F("DHT checksum OK"));
   } else {
-    DEBUG_PRINTLN(F("DHT checksum failure!"));
     _lastresult = false;
-    return _lastresult;
+    DEBUG_PRINTLN(F("DHT checksum failure!"));
   }
-}
-
-// Expect the signal line to be at the specified level for a period of time and
-// return a count of loop cycles spent at that level (this cycle count can be
-// used to compare the relative time of two pulses).  If more than a millisecond
-// ellapses without the level changing then the call fails with a 0 response.
-// This is adapted from Arduino's pulseInLong function (which is only available
-// in the very latest IDE versions):
-//   https://github.com/arduino/Arduino/blob/master/hardware/arduino/avr/cores/arduino/wiring_pulse.c
-uint32_t DHT::expectPulse(bool level) {
-// F_CPU is not be known at compile time on platforms such as STM32F103.
-// The preprocessor seems to evaluate it to zero in that case.
-#if (F_CPU > 16000000L) || (F_CPU == 0L)
-  uint32_t count = 0;
-#else
-  uint16_t count = 0; // To work fast enough on slower AVR boards
-#endif
-// On AVR platforms use direct GPIO port access as it's much faster and better
-// for catching pulses that are 10's of microseconds in length:
-#ifdef __AVR
-  uint8_t portState = level ? _bit : 0;
-  while ((*portInputRegister(_port) & _bit) == portState) {
-    if (count++ >= _maxcycles) {
-      return TIMEOUT; // Exceeded timeout, fail.
-    }
-  }
-// Otherwise fall back to using digitalRead (this seems to be necessary on
-// ESP8266 right now, perhaps bugs in direct port access functions?).
-#else
-  while (digitalRead(_pin) == level) {
-    if (count++ >= _maxcycles) {
-      return TIMEOUT; // Exceeded timeout, fail.
-    }
-  }
-#endif
-
-  return count;
+  _lastresult = true;
+  return _lastresult;
 }
